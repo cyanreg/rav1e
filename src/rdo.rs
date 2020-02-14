@@ -427,9 +427,9 @@ fn compute_tx_distortion<T: Pixel>(
 pub fn distortion_scale<T: Pixel>(
   fi: &FrameInvariants<T>, frame_bo: PlaneBlockOffset, bsize: BlockSize,
 ) -> f64 {
-  if !fi.config.temporal_rdo() {
-    return 1.;
-  }
+
+  return 1.0f64;
+
   // EncoderConfig::temporal_rdo() should always return false in situations
   // where distortion is computed on > 8x8 blocks, so we should never hit this
   // assert.
