@@ -12,7 +12,6 @@ use crate::hawktracer::*;
 use crate::tiling::*;
 use crate::util::*;
 use crate::transform::*;
-use crate::cpu_features::CpuFeatureLevel;
 use crate::SegmentationState;
 use crate::FrameInvariants;
 use TxSize::*;
@@ -26,6 +25,7 @@ pub struct ActivityMask {
   pub tot_bins: usize,
   pub seg_bins: [usize; 8],
   pub avg_var: f64,
+  pub var_scale: f64,
 }
 
 impl ActivityMask {
@@ -39,8 +39,7 @@ impl ActivityMask {
     let width = (((luma_plane.cfg.width >> act_granularity) << act_granularity)) + (1 << act_granularity);
     let height = (((luma_plane.cfg.height >> act_granularity) << act_granularity)) + (1 << act_granularity);
 
-    let mut variances =
-      Vec::with_capacity((width >> granularity) * (height >> granularity));
+    let mut variances = Vec::with_capacity((width >> granularity) * (height >> granularity));
     variances.resize((width >> granularity) * (height >> granularity), 0f64);
 
     let aligned_luma = Rect {
@@ -54,8 +53,17 @@ impl ActivityMask {
     let mut freq_storage: Aligned<[T::Coeff; 64 * 64]> = Aligned::uninitialized();
     let mut src_storage: Aligned<[i16; 64 * 64]> = Aligned::uninitialized();
 
-    let mut avg_var = 0f64;
-    let mut max = 0f64;
+    let tx_type = TxType::DCT_DCT;
+    let tx_size = match act_granularity {
+            2 => TX_4X4,
+            3 => TX_8X8,
+            4 => TX_16X16,
+            5 => TX_32X32,
+            6 => TX_64X64,
+            _ => unreachable!(),
+        };
+
+    let mut old_avg_var = 0f64;
 
     for y in 0..height >> act_granularity {
       for x in 0..width >> act_granularity {
@@ -68,18 +76,6 @@ impl ActivityMask {
 
         let block = luma.subregion(block_rect);
 
-        let cpu = CpuFeatureLevel::default();
-        let tx_size = match act_granularity {
-                2 => TX_4X4,
-                3 => TX_8X8,
-                4 => TX_16X16,
-                5 => TX_32X32,
-                6 => TX_64X64,
-                _ => unreachable!(),
-            };
-
-        let tx_type = TxType::DCT_DCT;
-
         let src = &mut src_storage.data[..tx_size.area()];
         let freq = &mut freq_storage.data[..tx_size.area()];
 
@@ -90,21 +86,21 @@ impl ActivityMask {
             }
         }
 
-        forward_transform(src, freq, tx_size.width(), tx_size, tx_type, 8, cpu);
+        forward_transform(src, freq, tx_size.width(), tx_size, tx_type,
+                          fi.sequence.bit_depth, fi.cpu_feature_level);
 
         let mut sum_f = 0f64;
 
         for y in 0..(1 << act_granularity) {
             for x in 0..(1 << act_granularity) {
-                if (x < 4) && (y < 4) { continue };
+                if (x < 2) && (y < 2) { continue };
                 let coeff = freq[y*(1 << act_granularity) + x];
                 sum_f += i32::cast_from(coeff).abs() as f64;
             }
         }
 
         sum_f /= (tot_pix - 4*4) as f64;
-        avg_var += sum_f;
-        max = max.max(sum_f);
+        old_avg_var += sum_f;
 
         /* Copy down to granularity */
         for i in 0..(1 << (act_granularity - granularity)) {
@@ -120,25 +116,59 @@ impl ActivityMask {
       }
     }
 
+    let tot_bins = variances.len();
+    let mut avg_var = 0f64;
+    let mut max = 0f64;
+
+    old_avg_var /= tot_bins as f64;
+
+    /* Merge temporal activity */
+    for y in 0..fi.h_in_imp_b {
+        for x in 0..fi.w_in_imp_b {
+
+            let propagate_cost = fi.block_importances[y * fi.w_in_imp_b + x] as f64;
+            let intra_cost = fi.lookahead_intra_costs[y * fi.w_in_imp_b + x] as f64;
+
+            let temporal_act =
+                if intra_cost == 0. {
+                    0.0f64
+                } else {
+                    let strength = 1.0; // empirical, see comment above
+                    let frac = (intra_cost + propagate_cost) / intra_cost;
+                    frac.powf(strength / 3.0) * old_avg_var
+                };
+
+            let element = variances.get_mut(y * (width >> granularity) + x);
+            match element {
+                Some(x) => {
+                    *x = *x + temporal_act;
+                    avg_var += *x;
+                    max = max.max(*x);
+                }
+                None => unreachable!(),
+            }
+        }
+    }
+
+    avg_var /= tot_bins as f64;
+    avg_var /= max;
+    avg_var *= 7f64;
+
     let mut seg_bins = [0usize; 8];
-    for i in 0..variances.len() {
+    for i in 0..tot_bins {
         let element = variances.get_mut(i);
         match element {
             Some(x) => {
-                *x = (*x / max) * 7f64;
+                *x = (*x / max).max(0f64).min(1.0f64) * 7f64;
                 seg_bins[(*x).round() as usize] += 1;
             }
             None => unreachable!(),
         }
     }
 
-    let tot_bins = variances.len();
+    let var_scale = max / 7f64;
 
-    avg_var /= tot_bins as f64;
-    avg_var /= max;
-    avg_var *= 7f64;
-
-    ActivityMask { variances, width, granularity, tot_bins, seg_bins, avg_var }
+    ActivityMask { variances, width, granularity, tot_bins, seg_bins, avg_var, var_scale }
   }
 
   pub fn segid_at(&self, segmentation: &SegmentationState, x: usize, y: usize) -> u8 {
@@ -154,7 +184,8 @@ impl ActivityMask {
     let dec_width = self.width >> self.granularity;
     let res = self.variances.get((x >> self.granularity) + dec_width * (y >> self.granularity));
     match res {
-        Some(val) => return *val,
+        /* avg_var is inversely proportional to the scaling necessary */
+        Some(val) => return (*val * self.var_scale) * (1400f64/((self.avg_var * self.var_scale).log(2f64))),
         None => unreachable!(),
     }
   }
